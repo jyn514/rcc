@@ -19,6 +19,7 @@ use cranelift_module::{Backend, Module};
 
 #[cfg(feature = "codegen")]
 pub use ir::initialize_aot_module;
+use target_lexicon::Triple;
 
 /// The `Source` type for `codespan::Files`.
 ///
@@ -93,7 +94,7 @@ impl From<VecDeque<CompileError>> for Error {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Opt {
     /// If set, print all tokens found by the lexer in addition to compiling.
     pub debug_lex: bool,
@@ -117,6 +118,28 @@ pub struct Opt {
 
     /// The directories to consider as part of the search path.
     pub search_path: Vec<PathBuf>,
+
+    /// The target triple to compile to.
+    ///
+    /// Defaults to the host target.
+    pub target: Triple,
+}
+
+// We can't derive(Default) for Opt because Triple::default() is Triple::Unknown :(
+impl Default for Opt {
+    fn default() -> Self {
+        Opt {
+            debug_lex: false,
+            debug_ast: false,
+            debug_asm: false,
+            no_link: false,
+            #[cfg(feature = "jit")]
+            jit: false,
+            max_errors: None,
+            search_path: Vec::new(),
+            target: Triple::host(),
+        }
+    }
 }
 
 /// Preprocess the source and return the tokens.
@@ -127,7 +150,7 @@ pub fn preprocess(
     files: &mut Files,
 ) -> WarningResult<VecDeque<Locatable<Token>>> {
     let path = opt.search_path.iter().map(|p| p.into());
-    let mut cpp = PreProcessor::new(file, buf, opt.debug_lex, path, files);
+    let mut cpp = PreProcessor::new(file, buf, opt.debug_lex, path, files, &opt.target);
 
     let mut tokens = VecDeque::new();
     let mut errs = VecDeque::new();
@@ -153,7 +176,7 @@ pub fn check_semantics(
     files: &mut Files,
 ) -> WarningResult<Vec<Locatable<hir::Declaration>>> {
     let path = opt.search_path.iter().map(|p| p.into());
-    let mut cpp = PreProcessor::new(file, buf, opt.debug_lex, path, files);
+    let mut cpp = PreProcessor::new(file, buf, opt.debug_lex, path, files, &opt.target);
     let mut errs = VecDeque::new();
 
     macro_rules! handle_err {
@@ -189,7 +212,10 @@ pub fn check_semantics(
     };
 
     let mut hir = vec![];
-    let mut parser = Analyzer::new(Parser::new(first, &mut cpp, opt.debug_ast));
+    let mut parser = Analyzer::new(
+        Parser::new(first, &mut cpp, opt.debug_ast),
+        opt.target.clone(),
+    );
     for res in &mut parser {
         match res {
             Ok(decl) => hir.push(decl),
@@ -219,7 +245,7 @@ pub fn compile<B: Backend>(
         (Err(errs), warnings) => return (Err(Error::Source(errs)), warnings),
         (Ok(hir), warnings) => (hir, warnings),
     };
-    let (result, ir_warnings) = ir::compile(module, hir, opt.debug_asm);
+    let (result, ir_warnings) = ir::compile(module, hir, opt.target.clone(), opt.debug_asm);
     warnings.extend(ir_warnings);
     (result.map_err(Error::from), warnings)
 }
@@ -267,10 +293,15 @@ mod jit {
     use crate::ir::get_isa;
     use cranelift_simplejit::{SimpleJITBackend, SimpleJITBuilder};
     use std::convert::TryFrom;
+    use target_lexicon::HOST;
 
     pub fn initialize_jit_module() -> Module<SimpleJITBackend> {
         let libcall_names = cranelift_module::default_libcall_names();
-        Module::new(SimpleJITBuilder::with_isa(get_isa(true), libcall_names))
+        Module::new(SimpleJITBuilder::with_isa(
+            // it doesn't make sense to cross compile for a JIT
+            get_isa(true, HOST),
+            libcall_names,
+        ))
     }
 
     /// Structure used to handle compiling C code to memory instead of to disk.

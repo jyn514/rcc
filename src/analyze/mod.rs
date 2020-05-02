@@ -6,7 +6,9 @@ use std::collections::{HashSet, VecDeque};
 use std::convert::TryInto;
 
 use counter::Counter;
+use target_lexicon::Triple;
 
+use crate::arch::Arch;
 use crate::data::{error::Warning, hir::*, lex::Keyword, *};
 use crate::intern::InternedStr;
 use crate::parse::{Lexer, Parser};
@@ -42,6 +44,8 @@ pub struct Analyzer<T: Lexer> {
     initialized: HashSet<MetadataRef>,
     /// Internal API which makes it easier to return errors lazily
     error_handler: ErrorHandler,
+    /// Which platform are we compiling for?
+    target: Triple,
     /// Hack to make compound assignment work
     ///
     /// For `a += b`, `a` must only be evaluated once.
@@ -82,7 +86,7 @@ impl<T: Lexer> Iterator for Analyzer<T> {
 }
 
 impl<I: Lexer> Analyzer<I> {
-    pub fn new(parser: Parser<I>) -> Self {
+    pub fn new(parser: Parser<I>, target: Triple) -> Self {
         Self {
             declarations: parser,
             error_handler: ErrorHandler::new(),
@@ -90,6 +94,7 @@ impl<I: Lexer> Analyzer<I> {
             tag_scope: Scope::new(),
             pending: VecDeque::new(),
             initialized: HashSet::new(),
+            target,
             decl_side_channel: Vec::new(),
         }
     }
@@ -580,14 +585,14 @@ impl<I: Lexer> Analyzer<I> {
             };
             // struct s { int i: 5 };
             if let Some(bitfield) = bitfield {
-                let bit_size = match Self::const_uint(self.parse_expr(bitfield)) {
+                let bit_size = match Self::const_uint(self.parse_expr(bitfield), &self.target) {
                     Ok(e) => e,
                     Err(err) => {
                         self.error_handler.push_back(err);
                         1
                     }
                 };
-                let type_size = symbol.ctype.sizeof().unwrap_or(0);
+                let type_size = symbol.ctype.sizeof(&self.target).unwrap_or(0);
                 if bit_size == 0 {
                     let err = SemanticError::from(format!(
                         "C does not have zero-sized types. hint: omit the declarator {}",
@@ -595,7 +600,7 @@ impl<I: Lexer> Analyzer<I> {
                     ));
                     self.err(err, location);
                 // struct s { int i: 65 }
-                } else if bit_size > type_size * u64::from(crate::arch::CHAR_BIT) {
+                } else if bit_size > type_size * u64::from(self.target.char_bit()) {
                     let err = SemanticError::from(format!(
                         "cannot have bitfield {} with size {} larger than containing type {}",
                         symbol.id, bit_size, symbol.ctype
@@ -687,10 +692,11 @@ impl<I: Lexer> Analyzer<I> {
         for (name, maybe_value) in ast_members {
             // enum E { A = 5 };
             if let Some(value) = maybe_value {
-                discriminant = Self::const_sint(self.parse_expr(value)).unwrap_or_else(|err| {
-                    self.error_handler.push_back(err);
-                    std::i64::MIN
-                });
+                discriminant = Self::const_sint(self.parse_expr(value), &self.target)
+                    .unwrap_or_else(|err| {
+                        self.error_handler.push_back(err);
+                        std::i64::MIN
+                    });
             }
             members.push((name, discriminant));
             // TODO: this is such a hack
@@ -835,10 +841,11 @@ impl<I: Lexer> Analyzer<I> {
             Array { of, size } => {
                 // int a[5]
                 let size = if let Some(expr) = size {
-                    let size = Self::const_uint(self.parse_expr(*expr)).unwrap_or_else(|err| {
-                        self.error_handler.push_back(err);
-                        1
-                    });
+                    let size = Self::const_uint(self.parse_expr(*expr), &self.target)
+                        .unwrap_or_else(|err| {
+                            self.error_handler.push_back(err);
+                            1
+                        });
                     ArrayType::Fixed(size)
                 } else {
                     // int a[]
@@ -937,21 +944,23 @@ impl<I: Lexer> Analyzer<I> {
         }
     }
     // used for arrays like `int a[BUF_SIZE - 1];` and enums like `enum { A = 1 }`
-    fn const_literal(expr: Expr) -> CompileResult<Literal> {
+    fn const_literal(expr: Expr, target: &Triple) -> CompileResult<Literal> {
         let location = expr.location;
-        expr.const_fold()?.into_literal().or_else(|runtime_expr| {
-            Err(Locatable::new(
-                SemanticError::NotConstant(runtime_expr).into(),
-                location,
-            ))
-        })
+        expr.const_fold(target)?
+            .into_literal()
+            .or_else(|runtime_expr| {
+                Err(Locatable::new(
+                    SemanticError::NotConstant(runtime_expr).into(),
+                    location,
+                ))
+            })
     }
     /// Return an unsigned integer that can be evaluated at compile time, or an error otherwise.
-    fn const_uint(expr: Expr) -> CompileResult<crate::arch::SIZE_T> {
+    fn const_uint(expr: Expr, target: &Triple) -> CompileResult<u64> {
         use Literal::*;
 
         let location = expr.location;
-        match Self::const_literal(expr)? {
+        match Self::const_literal(expr, target)? {
             UnsignedInt(i) => Ok(i),
             Int(i) => {
                 if i < 0 {
@@ -971,11 +980,11 @@ impl<I: Lexer> Analyzer<I> {
         }
     }
     /// Return a signed integer that can be evaluated at compile time, or an error otherwise.
-    fn const_sint(expr: Expr) -> CompileResult<i64> {
+    fn const_sint(expr: Expr, target: &Triple) -> CompileResult<i64> {
         use Literal::*;
 
         let location = expr.location;
-        match Self::const_literal(expr)? {
+        match Self::const_literal(expr, target)? {
             UnsignedInt(u) => match u.try_into() {
                 Ok(i) => Ok(i),
                 Err(_) => Err(Locatable::new(
@@ -1302,6 +1311,7 @@ pub(crate) mod test {
     use crate::data::types::{ArrayType, FunctionType, Type::*};
     use crate::lex::PreProcessor;
     use crate::parse::test::*;
+    use target_lexicon::HOST;
 
     pub(crate) fn analyze<'c, 'input: 'c, P, A, R, S, E>(
         input: &'input str,
@@ -1315,7 +1325,7 @@ pub(crate) mod test {
     {
         let mut p = parser(input);
         let ast = parse_func(&mut p)?;
-        let mut a = Analyzer::new(p);
+        let mut a = Analyzer::new(p, HOST);
         let e = analyze_func(&mut a, ast);
         if let Some(err) = a.error_handler.pop_front() {
             return Err(err);
@@ -1332,13 +1342,13 @@ pub(crate) mod test {
     }
 
     pub(crate) fn decls(s: &str) -> Vec<CompileResult<Declaration>> {
-        Analyzer::new(parser(s))
+        Analyzer::new(parser(s), HOST)
             .map(|o| o.map(|l| l.data))
             .collect()
     }
 
     pub(crate) fn assert_errs_decls(input: &str, errs: usize, warnings: usize, decls: usize) {
-        let mut a = Analyzer::new(parser(input));
+        let mut a = Analyzer::new(parser(input), HOST);
         let (mut a_errs, mut a_decls) = (0, 0);
         for res in &mut a {
             if res.is_err() {
