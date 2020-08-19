@@ -231,8 +231,9 @@ pub enum Token {
 
     // Misc
     Ellipsis,
-    StructDeref, // ->
-    Hash,        // #, used for preprocessing
+    StructDeref,    // ->
+    Hash,           // #, used for preprocessing
+    HashHash(bool), // ##, used for preprocessing (the bool is true unless it is created by `# ## #`)
 }
 
 /* impls */
@@ -393,6 +394,7 @@ impl std::fmt::Display for Token {
             Ellipsis => write!(f, "..."),
             StructDeref => write!(f, "->"),
             Hash => write!(f, "#"),
+            HashHash(_) => write!(f, "##"),
         }
     }
 }
